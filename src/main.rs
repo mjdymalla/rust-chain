@@ -4,13 +4,16 @@ use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
+use std::mem::replace;
 use std::sync::{Arc, Mutex, MutexGuard};
 use ed25519_dalek::{Keypair, Signature, PublicKey, Sha512, Digest};
 use rand::rngs::OsRng;
 use warp::Filter;
 use serde::{Serialize, Deserialize};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{Duration, sleep};
 use tokio::task;
+use tokio::sync::oneshot;
 use hex;
 
 struct Block {
@@ -159,16 +162,17 @@ impl Blockchain {
             // update hash of current block
             let new_hash = Self::calculate_hash(index, timestamp, &previous_hash);
             current_block.hash = new_hash;
-            // broadcast proposed block to network - for now just add block to network and log it
-            self.blocks.push(self.proposed_block);
-            // create new proposed block
-            self.proposed_block = Block {
+
+            let replacement = Block {
                 index: index + 1,
                 size: 0,
                 timestamp: Utc::now().timestamp() as u64,
                 transactions: Vec::new(),
-                hash: String::new()
+                hash: String::new(),
             };
+
+            // add complete block to chain and replace with new block
+            self.blocks.push(replace(&mut self.proposed_block, replacement));
         }
     }
 
@@ -255,16 +259,30 @@ async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
 
 #[tokio::main]
 async fn main() {
+    // oneshot channel to receive shutdown signal
+    let (tx, rx) = oneshot::channel();
+    let shutdown_sig = Arc::new(Mutex::new(tx));
+
+    // spawn thread to listen for SIGINT
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let tx_clone = Arc::clone(&shutdown_sig);
+    tokio::spawn(async move {
+        sigint.recv().await;
+        let sig = tx_clone.lock().unwrap();
+        //let _ = sig.send(());
+    });
+
+
     // initialise chain
-    let mut chain = Blockchain::apply(100);
+    let chain = Blockchain::apply(100);
     let chain_mutex = Arc::new(Mutex::new(chain));
     let chain_clone = Arc::clone(&chain_mutex);
 
-    let routes = create_wallet().or(receive_transaction(chain_clone));
+    let routes = create_wallet().or(receive_transaction(Arc::clone(&chain_clone)));
 
-    let worker = task::spawn(transaction_worker(chain_clone));
+    let worker = task::spawn(transaction_worker(Arc::clone(&chain_clone)));
 
-    warp::serve(routes)
+    let server = warp::serve(routes)
         .run(([127, 0, 0, 1], 3030))
         .await;
 }
