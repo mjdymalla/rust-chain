@@ -1,9 +1,7 @@
-use crypto_hash::{Algorithm, hex_digest, digest};
-use chrono::{Utc, TimeZone};
+use crypto_hash::{Algorithm, hex_digest};
+use chrono::Utc;
 use std::collections::VecDeque;
 use std::collections::HashMap;
-use std::error::Error;
-use std::io;
 use std::mem::replace;
 use std::sync::{Arc, Mutex, MutexGuard};
 use ed25519_dalek::{Keypair, Signature, PublicKey, Sha512, Digest};
@@ -15,6 +13,7 @@ use tokio::time::{Duration, sleep};
 use tokio::task;
 use tokio::sync::oneshot;
 use hex;
+use colored::*;
 
 struct Block {
     index: u32,
@@ -208,7 +207,7 @@ fn receive_transaction(chain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = i
             // acquire lock on chain
             let mut chain: MutexGuard<Blockchain> = chain.lock().unwrap();
 
-            // create Signature from string
+            // build a 'Signature' from the hex string (signature is being received initially as a string)
             let signature_bytes = hex::decode(&transaction_payload.signature).unwrap();
             let signature = Signature::from_bytes(&signature_bytes).unwrap();
 
@@ -221,7 +220,7 @@ fn receive_transaction(chain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = i
                 signature,
             };
 
-            // create public key from string
+            // build a 'PublicKey' from the hex string (senders key is being received initially as a string)
             let public_key_bytes = hex::decode(transaction.from.clone()).unwrap();
             let public_key = PublicKey::from_bytes(&public_key_bytes).unwrap();
 
@@ -241,7 +240,9 @@ fn receive_transaction(chain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = i
 // transaction worker function (simulates mining)
 async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
     loop {
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(10)).await;
+
+        println!("{}", "Worker - checking for pending transactions...".yellow());
 
         // acquire lock on chain
         let mut chain = chain.lock().unwrap();
@@ -252,7 +253,7 @@ async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
                 chain.add_transaction(transaction);
             }
         } else {
-            println!("No transactions to process");
+            println!("{}", "Worker - pool empty...".yellow());
         }
     }
 }
@@ -261,28 +262,29 @@ async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
 async fn main() {
     // oneshot channel to receive shutdown signal
     let (tx, rx) = oneshot::channel();
-    let shutdown_sig = Arc::new(Mutex::new(tx));
-
-    // spawn thread to listen for SIGINT
-    let mut sigint = signal(SignalKind::interrupt()).unwrap();
-    let tx_clone = Arc::clone(&shutdown_sig);
-    tokio::spawn(async move {
-        sigint.recv().await;
-        let sig = tx_clone.lock().unwrap();
-        //let _ = sig.send(());
-    });
-
 
     // initialise chain
     let chain = Blockchain::apply(100);
     let chain_mutex = Arc::new(Mutex::new(chain));
     let chain_clone = Arc::clone(&chain_mutex);
-
-    let routes = create_wallet().or(receive_transaction(Arc::clone(&chain_clone)));
-
     let worker = task::spawn(transaction_worker(Arc::clone(&chain_clone)));
 
-    let server = warp::serve(routes)
-        .run(([127, 0, 0, 1], 3030))
-        .await;
+    let routes = create_wallet().or(receive_transaction(Arc::clone(&chain_clone)));
+    let server = warp::serve(routes);
+    let (_, server_future) = server.bind_with_graceful_shutdown(([127, 0, 0, 1], 3030), async {
+        rx.await.ok();
+    });
+
+    // spawn thread to listen for SIGINT
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    tokio::spawn(async move {
+        sigint.recv().await;
+        let _ = tx.send(());
+        println!("Shutting down server...");
+        worker.abort();
+    });
+
+    // run server
+    println!("{}", "Server started on port 3030...".green());
+    server_future.await;
 }
