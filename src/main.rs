@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::mem::replace;
 use std::sync::{Arc, Mutex, MutexGuard};
-use ed25519_dalek::{Keypair, Signature, PublicKey, Sha512, Digest};
+use ed25519_dalek::{Keypair, Signature, PublicKey, Sha512, Digest, SecretKey};
 use rand::rngs::OsRng;
 use warp::Filter;
 use serde::{Serialize, Deserialize};
@@ -58,7 +58,7 @@ struct Wallet {
 impl Blockchain {
     // create chain with genesis block
     fn apply(max_block_size: u32) -> Self {
-        println!("Initialising blockchain...");
+        println!("{}", "Initialising blockchain...".blue());
 
         let mut chain = Self {
             blocks: Vec::new(),
@@ -76,10 +76,8 @@ impl Blockchain {
         };
 
         // test wallet with funds
-        let wallet = generate_keypair();
-        println!("pub key: {}", wallet.public_key);
-        println!("priv key: {}", wallet.private_key);
-        chain.balances.insert(wallet.public_key, 1000);
+        let pub_key = String::from("373d301767b590bbcc4305aa7ed66bde1178d2a99e2d48fcb59717938d552fd7");
+        chain.balances.insert(pub_key, 1000);
 
         // create genesis block
         let genesis_block = Block {
@@ -95,7 +93,21 @@ impl Blockchain {
         return chain;
     }
 
-    // check transaction is valid, sender has appropriate funds, and is signed with private key
+    /// Validates a transaction by checking the sender's balance, verifying the signature, and returning a result.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - A reference to the current instance of the structure.
+    /// * `transaction` - A reference to the `Transaction` object to validate.
+    /// * `public_key` - The public key used for signature verification.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if the transaction is valid.
+    /// * `Err("Insufficient funds")` if the sender does not have enough balance for the transaction.
+    /// * `Err("Sender address does not exist")` if the sender's address is not found.
+    /// * `Err("Invalid signature")` if the transaction signature is not valid.
+    ///
     fn validate_transaction(&self, transaction: &Transaction, public_key: PublicKey) -> Result<bool, String> {
         if let Some(&balance) = self.balances.get(&transaction.from) {
             if balance < transaction.amount {
@@ -121,8 +133,14 @@ impl Blockchain {
         return Ok(true);
     }
 
-    // add transaction to proposed block
-    fn add_transaction(&mut self, transaction: Transaction) {
+    /// Adds a transaction to the blockchain, updating balances and creating new blocks if necessary.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - A mutable reference to the current instance of the structure.
+    /// * `transaction` - The `Transaction` object to add to the blockchain.
+    ///
+    fn add_transaction(&mut self, transaction: Transaction) -> () {
         // prev hash - used to create new blocks hash
         let previous_hash: String = if let Some(last_block) = self.blocks.last() {
             last_block.hash.clone()
@@ -198,6 +216,52 @@ fn create_wallet() -> impl Filter<Extract = impl warp::Reply, Error = warp::Reje
         .map(move || warp::reply::json(&generate_keypair()))
 }
 
+// sign message with private key
+fn create_signature(public_key: &String, private_key: &String, from: &String, to: &String, amount: &String) -> Signature {
+    let context: &[u8] = b"transaction";
+
+    let keypair = Keypair { 
+        public: PublicKey::from_bytes(&hex::decode(public_key).unwrap()).unwrap(),
+        secret: SecretKey::from_bytes(&hex::decode(private_key).unwrap()).unwrap()
+    };
+
+    let mut prehashed = Sha512::new();
+
+    prehashed.update(from.as_bytes());
+    prehashed.update(to.as_bytes());
+    prehashed.update(amount.as_bytes());
+
+    let signature = keypair.sign_prehashed(prehashed, Some(context));
+
+    signature.unwrap()
+}
+
+// create entire test transaction
+fn create_test_transaction() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("create_test_transaction")
+        .map(move || {
+            let wallet = generate_keypair();
+
+            let signature = create_signature(
+                &wallet.public_key, 
+                &wallet.private_key, 
+                &String::from("from"), 
+                &String::from("to"), 
+                &String::from("amount")
+            );
+
+            let tx = TransactionPayload {
+                from: String::from("from"),
+                to: String::from("to"),
+                amount: 1,
+                rads: 1,
+                signature: hex::encode(signature.to_bytes()),
+            };
+
+            warp::reply::json(&tx)
+        })
+}
+
 // endpoint to receive transactions
 fn receive_transaction(chain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("transaction")
@@ -240,9 +304,9 @@ fn receive_transaction(chain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = i
 // transaction worker function (simulates mining)
 async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
     loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(20)).await;
 
-        println!("{}", "Worker - checking for pending transactions...".yellow());
+        println!("{}", "Worker - checking for pending transactions...".cyan());
 
         // acquire lock on chain
         let mut chain = chain.lock().unwrap();
@@ -253,7 +317,7 @@ async fn transaction_worker(chain: Arc<Mutex<Blockchain>>) -> () {
                 chain.add_transaction(transaction);
             }
         } else {
-            println!("{}", "Worker - pool empty...".yellow());
+            println!("{}", "Worker - pool empty...".cyan());
         }
     }
 }
@@ -280,7 +344,7 @@ async fn main() {
     tokio::spawn(async move {
         sigint.recv().await;
         let _ = tx.send(());
-        println!("Shutting down server...");
+        println!("{}", "Shutting down server...".yellow());
         worker.abort();
     });
 
@@ -288,3 +352,6 @@ async fn main() {
     println!("{}", "Server started on port 3030...".green());
     server_future.await;
 }
+
+// "public_key": "bb51a80777e27e7efd681d575ec7e1b5d95d808d72cd26239e427d1897c5614b",
+// "private_key": "557b8c52c12ac4fdb52d76ec508988808bf671f58451f05b925df28f8a74056b"
